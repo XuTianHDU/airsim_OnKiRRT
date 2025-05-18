@@ -26,7 +26,7 @@ struct State
 {
     double x, y, z;
 
-    double distanceTo(const State &other) const
+    double distanceTo(const State& other) const
     {
         double dx = x - other.x;
         double dy = y - other.y;
@@ -46,14 +46,6 @@ struct Control
     double x, y, z;
 };
 
-// 环境设置
-struct OnKiEnvironment
-{
-    std::vector<std::vector<double>> obstacles; // [x,y,z,radius]
-    double max_velocity = 5.0;
-    double world_boundary[6] = {-1000, 1000, -1000, 1000, -200, 10};
-};
-
 // 树节点
 struct TreeNode
 {
@@ -65,7 +57,7 @@ struct TreeNode
 };
 
 // ChunkGrid参数
-const float CHUNK_SIZE = 5.0f;      // 每个块的大小(米)
+const float CHUNK_SIZE = 1.5f;       // 每个块的大小(米)
 const float RESOLUTION = 0.5f;       // 分辨率(米)
 const float COLLISION_RADIUS = 1.0f; // 碰撞检测半径(米)
 
@@ -77,14 +69,14 @@ struct ChunkCoord
     // 构造函数
     ChunkCoord(int x_ = 0, int y_ = 0, int z_ = 0) : x(x_), y(y_), z(z_) {}
 
-    bool operator==(const ChunkCoord &other) const
+    bool operator==(const ChunkCoord& other) const
     {
         return x == other.x && y == other.y && z == other.z;
     }
 
     struct Hash
     {
-        size_t operator()(const ChunkCoord &coord) const
+        size_t operator()(const ChunkCoord& coord) const
         {
             return ((coord.x * 73856093) ^ (coord.y * 19349663) ^ (coord.z * 83492791));
         }
@@ -99,7 +91,7 @@ struct Chunk
 };
 
 // 将四元数转换为旋转矩阵
-Eigen::Matrix3f quaternionToRotationMatrix(const Quaternionr &q)
+Eigen::Matrix3f quaternionToRotationMatrix(const Quaternionr& q)
 {
     float w = q.w();
     float x = q.x();
@@ -117,26 +109,29 @@ Eigen::Matrix3f quaternionToRotationMatrix(const Quaternionr &q)
 class OnKiRRTPlanner
 {
 private:
+    Vector3r drone_position_;
+    Quaternionr drone_orientation_;
     CameraInfo camera_info_;
 
-    OnKiEnvironment env;
     const int planning_horizon = 10;       // 规划步数
     const int max_samples_per_step = 1000; // 每步最大采样次数
-    const double step_size = 2.0;
+    const double step_size = 1.0;
+
+    const double velocity = 3.0;
 
     // 双缓冲路径存储
     std::vector<State> path_buffer_a;
     std::vector<State> path_buffer_b;
-    std::vector<State> *current_path_ptr = &path_buffer_a;
-    std::vector<State> *planning_path_ptr = &path_buffer_b;
+    std::vector<State>* current_path_ptr = &path_buffer_a;
+    std::vector<State>* planning_path_ptr = &path_buffer_b;
     std::mutex path_mutex_;
 
     // 规划线程控制
-    std::atomic<bool> planning_thread_running_{true};
+    std::atomic<bool> planning_thread_running_{ true };
     std::thread planning_thread_;
 
     // 执行线程控制
-    std::atomic<bool> execution_thread_running_{true};
+    std::atomic<bool> execution_thread_running_{ true };
     std::thread execution_thread_;
 
     // 控制频率统计相关
@@ -147,28 +142,125 @@ private:
     double max_control_interval = 0.0;
 
     // 点云处理线程相关
-    std::atomic<bool> pointcloud_thread_running_{true};
+    std::atomic<bool> pointcloud_thread_running_{ true };
     std::thread pointcloud_thread_;
     std::queue<std::vector<Vector3r>> pointcloud_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
     // 深度图像处理线程相关
-    std::atomic<bool> depth_image_thread_running_{true};
+    std::atomic<bool> depth_image_thread_running_{ true };
     std::thread depth_image_thread_;
 
     // 轨迹跟踪相关
-    std::atomic<size_t> current_path_index{0};
-    std::atomic<bool> new_path_available{false};
+    std::atomic<size_t> current_path_index{ 0 };
+    std::atomic<bool> new_path_available{ false };
+
+    // 辅助方法实现
+    void stopAllThreads()
+    {
+        planning_thread_running_ = false;
+        execution_thread_running_ = false;
+        depth_image_thread_running_ = false;
+        pointcloud_thread_running_ = false;
+
+        // 唤醒可能等待的线程
+        queue_cv_.notify_all();
+
+        // 等待线程结束
+        if (planning_thread_.joinable())
+            planning_thread_.join();
+        if (execution_thread_.joinable())
+            execution_thread_.join();
+        if (depth_image_thread_.joinable())
+            depth_image_thread_.join();
+        if (pointcloud_thread_.joinable())
+            pointcloud_thread_.join();
+
+        std::cout << "All worker threads stopped" << std::endl;
+    }
+
+    void resetAirsimState(const State& new_start)
+    {
+        // 取消当前所有任务
+        airsim_client.cancelLastTask();
+
+        // 重置API控制
+        airsim_client.enableApiControl(false);
+        airsim_client.armDisarm(false);
+
+        // 设置新位置（保持当前姿态）
+        auto current_pose = airsim_client.simGetVehiclePose();
+        Pose new_pose(
+            Vector3r(new_start.x, new_start.y, new_start.z),
+            current_pose.orientation // 保持当前姿态
+        );
+        airsim_client.simSetVehiclePose(new_pose, true);
+
+        // 重新获取控制权
+        airsim_client.enableApiControl(true);
+        airsim_client.armDisarm(true);
+
+        // 等待状态稳定
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::cout << "AirSim state reset to new position" << std::endl;
+    }
+
+    void clearPlanningState(const State& new_start, const State& new_goal)
+    {
+        // 更新原子状态
+        current_state.store(new_start);
+        goal_state.store(new_goal);
+
+        // 清除路径数据
+        {
+            std::lock_guard<std::mutex> lock(path_mutex_);
+            current_path_ptr->clear();
+            planning_path_ptr->clear();
+            current_path_index = 0;
+            new_path_available = false;
+        }
+
+        // 清除点云数据
+        {
+            std::lock_guard<std::mutex> lock(grid_mutex_);
+            chunk_grid_.clear();
+        }
+
+        // 清空点云队列
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            std::queue<std::vector<Vector3r>> empty_queue;
+            std::swap(pointcloud_queue_, empty_queue);
+        }
+
+        std::cout << "Planning state cleared" << std::endl;
+    }
+
+    void restartAllThreads()
+    {
+        // 重置控制标志
+        planning_thread_running_ = true;
+        execution_thread_running_ = true;
+        depth_image_thread_running_ = true;
+        pointcloud_thread_running_ = true;
+
+        // 重新启动线程
+        pointcloud_thread_ = std::thread(&OnKiRRTPlanner::pointCloudWorker, this);
+        depth_image_thread_ = std::thread(&OnKiRRTPlanner::processDepthImage, this);
+        planning_thread_ = std::thread(&OnKiRRTPlanner::planningWorker, this);
+        execution_thread_ = std::thread(&OnKiRRTPlanner::executionWorker, this);
+
+        // 验证线程启动
+        std::cout << "All worker threads restarted" << std::endl;
+    }
 
 public:
     MultirotorRpcLibClient airsim_client;
     std::atomic<State> current_state;
     std::atomic<State> goal_state;
-    Vector3r drone_position_;
-    Quaternionr drone_orientation_;
-    OnKiRRTPlanner(const State &start, const State &goal, const OnKiEnvironment &env)
-        : current_state(start), goal_state(goal), env(env)
+    OnKiRRTPlanner(const State& start, const State& goal)
+        : current_state(start), goal_state(goal)
     {
 
         // 初始化AirSim连接
@@ -225,27 +317,42 @@ public:
         airsim_client.enableApiControl(false);
     }
 
+    void reset(const State& new_start, const State& new_goal)
+    {
+        // 1. 停止所有线程
+        stopAllThreads();
+
+        // 2. 重置AirSim连接和无人机状态
+        resetAirsimState(new_start);
+
+        // 3. 清除所有规划状态
+        clearPlanningState(new_start, new_goal);
+
+        // 4. 重新启动所有线程
+        restartAllThreads();
+
+        std::cout << "Reset completed. New start: (" << new_start.x << ", " << new_start.y << ", " << new_start.z
+            << "), New goal: (" << new_goal.x << ", " << new_goal.y << ", " << new_goal.z << ")" << std::endl;
+    }
+
     void updateCurrentState()
     {
         auto position = airsim_client.simGetVehiclePose().position;
-        current_state.store(State{ position.x(), position.y(), position.z()});
-        //std::cout << position.x() << "," << position.y() << "," << position.z() << std::endl;
+        current_state.store({ position.x(), position.y(), position.z() });
+        // std::cout << position.x() << "," << position.y() << "," << position.z() << std::endl;
     }
 
     bool isGoalReached() const
     {
-        State current = current_state;
+        State current = current_state.load();
         State goal = goal_state.load();
         return current.distanceTo(goal) <= goal_tolerance;
     }
-
-    void setNewGoal(const State &new_goal)
+    void setNewGoal(const State& start, const State& goal)
     {
-        goal_state = State(new_goal);
-        new_path_available = false; // 强制重新规划
-        current_path_index = 0;
-        current_path_ptr->clear();
-        std::cout << "New goal set: [" << new_goal.x << ", " << new_goal.y << ", " << new_goal.z << "]" << std::endl;
+        goal_state = State(goal);
+        clearPlanningState(start,goal);
+        std::cout << "New goal set: [" << goal.x << ", " << goal.y << ", " << goal.z << "]" << std::endl;
     }
 
 private:
@@ -254,16 +361,16 @@ private:
     std::mutex grid_mutex_;
 
     // 获取点所在的块坐标
-    ChunkCoord getChunkCoord(const Vector3r &point) const
+    ChunkCoord getChunkCoord(const Vector3r& point) const
     {
         return {
             static_cast<int>(floor(point.x() / CHUNK_SIZE)),
             static_cast<int>(floor(point.y() / CHUNK_SIZE)),
-            static_cast<int>(floor(point.z() / CHUNK_SIZE))};
+            static_cast<int>(floor(point.z() / CHUNK_SIZE)) };
     }
 
     // 检测碰撞
-    bool isCollision(const Vector3r &point)
+    bool isCollision(const Vector3r& point)
     {
         const float radius_sq = COLLISION_RADIUS * COLLISION_RADIUS;
 
@@ -284,14 +391,14 @@ private:
         }
 
         // 检查每个块中的点
-        for (const auto &coord : chunks_to_check)
+        for (const auto& coord : chunks_to_check)
         {
             std::unique_lock<std::mutex> lock(grid_mutex_);
             auto it = chunk_grid_.find(coord);
             if (it != chunk_grid_.end())
             {
                 std::lock_guard<std::mutex> chunk_lock(it->second.mutex);
-                for (const auto &p : it->second.points)
+                for (const auto& p : it->second.points)
                 {
                     if ((p - point).squaredNorm() < radius_sq)
                     {
@@ -305,13 +412,15 @@ private:
     }
 
     // 规划线程工作函数
-    void planningWorker() {
+    void planningWorker()
+    {
         std::vector<std::shared_ptr<TreeNode>> tree;
         steady_clock::time_point last_print_time = steady_clock::now();
         int iteration_count = 0;
         constexpr double print_interval = 1.0; // 打印频率间隔(秒)
 
-        while (planning_thread_running_) {
+        while (planning_thread_running_)
+        {
             auto start_time = steady_clock::now();
 
             // 获取当前状态和目标状态
@@ -336,7 +445,8 @@ private:
             auto current_time = steady_clock::now();
             double elapsed = duration_cast<duration<double>>(current_time - last_print_time).count();
 
-            if (elapsed >= print_interval) {
+            if (elapsed >= print_interval)
+            {
                 double frequency = iteration_count / elapsed;
                 std::cout << "[Planning] Frequency: " << frequency << " Hz" << std::endl;
 
@@ -351,45 +461,66 @@ private:
     }
 
     // 执行线程工作函数
-    void executionWorker() {
-        steady_clock::time_point last_print_time = steady_clock::now();
-        int iteration_count = 0;
-        constexpr double print_interval = 1.0; // 打印频率间隔(秒)
+    void executionWorker()
+    {
+        using clock = high_resolution_clock;
 
-        while (execution_thread_running_) {
+        constexpr microseconds target_interval(10000); // 100Hz = 10,000μs
+        constexpr double print_interval = 1.0;         // 打印频率间隔(秒)
+
+        time_point<clock> last_print_time = clock::now();
+        time_point<clock> next_frame_time = clock::now() + target_interval;
+        int iteration_count = 0;
+
+        while (execution_thread_running_)
+        {
+            updateCurrentState();
+
             // 检查是否有新路径
-            if (new_path_available) {
-                std::lock_guard<std::mutex> lock(path_mutex_);
+            if (new_path_available)
+            {
+                lock_guard<mutex> lock(path_mutex_);
                 current_path_index = 0;
                 new_path_available = false;
             }
 
             // 执行当前路径
+            auto exec_start = clock::now();
             executeCurrentPath();
+            auto exec_time = duration_cast<microseconds>(clock::now() - exec_start);
 
             // 更新迭代计数
             iteration_count++;
 
-            // 检查是否到达打印时间间隔
-            auto current_time = steady_clock::now();
+            // 打印频率信息
+            auto current_time = clock::now();
             double elapsed = duration_cast<duration<double>>(current_time - last_print_time).count();
-
-            if (elapsed >= print_interval) {
+            if (elapsed >= print_interval)
+            {
                 double frequency = iteration_count / elapsed;
-                std::cout << "[Executing] Frequency: " << frequency << " Hz" << std::endl;
-
-                // 重置计数器和时间
+                cout << "[Executing] Frequency: " << frequency << " Hz" << std::endl;
                 iteration_count = 0;
                 last_print_time = current_time;
             }
 
-            // 控制执行频率
-            this_thread::sleep_for(milliseconds(10));
+            // 精确控制频率
+            if (exec_time > target_interval)
+            {
+                cerr << "Warning: Execution time " << exec_time.count()
+                    << "μs exceeds target interval " << target_interval.count()
+                    << "μs" << endl;
+                next_frame_time = clock::now() + target_interval;
+            }
+            else
+            {
+                this_thread::sleep_until(next_frame_time);
+                next_frame_time += target_interval;
+            }
         }
     }
 
     // RRT路径规划
-    std::vector<State> planPath(const State &start, const State &goal, std::vector<std::shared_ptr<TreeNode>> &tree)
+    std::vector<State> planPath(const State& start, const State& goal, std::vector<std::shared_ptr<TreeNode>>& tree)
     {
         tree.clear();
 
@@ -409,7 +540,7 @@ private:
         {
             // 获取上一层的所有节点
             std::vector<std::shared_ptr<TreeNode>> parent_nodes;
-            for (const auto &node : tree)
+            for (const auto& node : tree)
             {
                 if (node->depth == step - 1)
                 {
@@ -428,7 +559,7 @@ private:
                 auto parent = parent_nodes[parent_dist(gen)];
 
                 // 采样目标点（50%概率采样终点）
-                State target = (goal_bias(gen) < 0.5) ? goal : randomState();
+                State target = (goal_bias(gen) < 0.3) ? goal : randomState();
 
                 // 向目标方向扩展
                 State new_state = steer(parent->state, target);
@@ -438,7 +569,7 @@ private:
                 {
                     auto new_node = std::make_shared<TreeNode>();
                     new_node->state = new_state;
-                    new_node->control = {new_state.x, new_state.y, new_state.z};
+                    new_node->control = { new_state.x, new_state.y, new_state.z };
                     new_node->parent = parent;
                     new_node->depth = step;
                     new_node->cost = parent->cost + parent->state.distanceTo(new_state);
@@ -450,7 +581,7 @@ private:
 
         // 寻找最优路径
         std::vector<std::shared_ptr<TreeNode>> goal_nodes;
-        for (const auto &node : tree)
+        for (const auto& node : tree)
         {
             if (node->state.distanceTo(goal) <= goal_tolerance)
             {
@@ -464,7 +595,7 @@ private:
             double min_dist = std::numeric_limits<double>::max();
             std::shared_ptr<TreeNode> best_node = nullptr;
 
-            for (const auto &node : tree)
+            for (const auto& node : tree)
             {
                 double dist = node->state.distanceTo(goal);
                 if (dist < min_dist)
@@ -486,10 +617,10 @@ private:
         {
             // 选择成本最低的路径
             auto best_node = *std::min_element(goal_nodes.begin(), goal_nodes.end(),
-                                               [](const std::shared_ptr<TreeNode> &a, const std::shared_ptr<TreeNode> &b)
-                                               {
-                                                   return a->cost < b->cost;
-                                               });
+                [](const std::shared_ptr<TreeNode>& a, const std::shared_ptr<TreeNode>& b)
+                {
+                    return a->cost < b->cost;
+                });
 
             // 提取完整路径
             auto current = best_node;
@@ -505,9 +636,10 @@ private:
     }
 
     // 执行当前路径
-    void executeCurrentPath() {
-
-        if (current_path_ptr->empty()) {
+    void executeCurrentPath()
+    {
+        if (current_path_ptr->empty())
+        {
             return;
         }
 
@@ -517,31 +649,54 @@ private:
         // 寻找路径上最近的点
         size_t nearest_index = 0;
         double min_dist = std::numeric_limits<double>::max();
-        for (size_t i = current_path_index; i < current_path_ptr->size(); ++i) {
+        for (size_t i = current_path_index; i < current_path_ptr->size(); ++i)
+        {
             double dist = current.distanceTo((*current_path_ptr)[i]);
-            if (dist < min_dist) {
+            if (dist < min_dist)
+            {
                 min_dist = dist;
                 nearest_index = i;
             }
         }
-        //std::cout << nearest_index << std::endl;
-        // 向前看3个点（如果存在）
-        size_t target_index = std::min(nearest_index + 3, current_path_ptr->size() - 1);
-        State target = (*current_path_ptr)[target_index];
 
-        //std::cout << target.x << "," << target.y << "xxx" << target.z << std::endl;
+        // 计算要发送的路径点数量（最多3个点）
+        size_t points_to_send = std::min(static_cast<size_t>(3), current_path_ptr->size() - nearest_index);
+
+        // 准备路径点向量
+        std::vector<Vector3r> path_points;
+        path_points.reserve(points_to_send);
+
+        for (size_t i = 0; i < points_to_send; ++i)
+        {
+            const State& state = (*current_path_ptr)[nearest_index + i];
+            path_points.emplace_back(state.x, state.y, state.z);
+        }
 
         // 执行移动
-        airsim_client.moveToPositionAsync(
-            target.x, target.y, target.z, env.max_velocity,
-            60.0f, DrivetrainType::ForwardOnly, YawMode(false, 0.0f)
-        );
+        if (!path_points.empty())
+        {
+            // 使用moveOnPath方法
+            airsim_client.moveOnPathAsync(
+                path_points,
+                velocity,
+                std::numeric_limits<double>::max(), // 无限时间
+                DrivetrainType::ForwardOnly,
+                YawMode(false, 0.0f));
 
-        // 更新控制统计
-        //updateControlStats(steady_clock::now());
-
-        // 更新当前路径索引
-        current_path_index = target_index;
+            // 更新当前路径索引，从第三个点开始（如果存在）
+            if (points_to_send >= 3)
+            {
+                current_path_index = nearest_index + 2; // 从第三个点开始
+            }
+            else
+            {
+                current_path_index = nearest_index + points_to_send - 1;
+            }
+        }
+        // std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        //
+        //  更新控制统计
+        // updateControlStats(steady_clock::now());
     }
 
     void updateControlStats(steady_clock::time_point control_start)
@@ -582,10 +737,10 @@ private:
         std::uniform_real_distribution<> x_dist(current.x - 25, current.x + 25);
         std::uniform_real_distribution<> y_dist(current.y - 25, current.y + 25);
         std::uniform_real_distribution<> z_dist(-3.0f, -1.0f);
-        return {x_dist(gen), y_dist(gen), z_dist(gen)};
+        return { x_dist(gen), y_dist(gen), z_dist(gen) };
     }
 
-    State steer(const State &from, const State &to) const
+    State steer(const State& from, const State& to) const
     {
         double dist = from.distanceTo(to);
         if (dist <= step_size)
@@ -595,10 +750,10 @@ private:
         return {
             from.x + (to.x - from.x) * ratio,
             from.y + (to.y - from.y) * ratio,
-            from.z + (to.z - from.z) * ratio};
+            from.z + (to.z - from.z) * ratio };
     }
 
-    bool isPathValid(const State &from, const State &to)
+    bool isPathValid(const State& from, const State& to)
     {
         // 检查终点是否有效
         if (!isStateValid(to))
@@ -610,7 +765,7 @@ private:
         const double path_length = from.distanceTo(to);
 
         // 计算需要检测的点的数量（每0.5米一个点）
-        const double check_interval = COLLISION_RADIUS * 0.5; // 0.5米间隔
+        const double check_interval = COLLISION_RADIUS * 0.5;
         const int steps = static_cast<int>(path_length / check_interval);
 
         // 沿路径均匀采样检测
@@ -620,7 +775,7 @@ private:
             State intermediate{
                 from.x + (to.x - from.x) * ratio,
                 from.y + (to.y - from.y) * ratio,
-                from.z + (to.z - from.z) * ratio};
+                from.z + (to.z - from.z) * ratio };
 
             if (!isStateValid(intermediate))
             {
@@ -630,16 +785,8 @@ private:
         return true;
     }
 
-    bool isStateValid(const State &s)
+    bool isStateValid(const State& s)
     {
-        // 检查世界边界
-        if (s.x < env.world_boundary[0] || s.x > env.world_boundary[1] ||
-            s.y < env.world_boundary[2] || s.y > env.world_boundary[3] ||
-            s.z < env.world_boundary[4] || s.z > env.world_boundary[5])
-        {
-            return false;
-        }
-
         // 检查障碍物碰撞
         if (isCollision(Vector3r(s.x, s.y, s.z)))
             return false;
@@ -658,7 +805,7 @@ private:
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 queue_cv_.wait(lock, [this]()
-                               { return !pointcloud_queue_.empty() || !pointcloud_thread_running_; });
+                    { return !pointcloud_queue_.empty() || !pointcloud_thread_running_; });
 
                 if (!pointcloud_thread_running_)
                     break;
@@ -679,12 +826,12 @@ private:
     }
 
     // 处理新点云数据
-    void processNewPoints(const std::vector<Vector3r> &new_points)
+    void processNewPoints(const std::vector<Vector3r>& new_points)
     {
         // 首先将点分配到对应的块中
         std::unordered_map<ChunkCoord, std::vector<Vector3r>, ChunkCoord::Hash> temp_chunks;
 
-        for (const auto &point : new_points)
+        for (const auto& point : new_points)
         {
             ChunkCoord coord = getChunkCoord(point);
             temp_chunks[coord].push_back(point);
@@ -692,19 +839,19 @@ private:
 
         // 将点合并到主网格中
         std::lock_guard<std::mutex> lock(grid_mutex_);
-        for (auto &entry : temp_chunks)
+        for (auto& entry : temp_chunks)
         {
-            const ChunkCoord &coord = entry.first;
-            const std::vector<Vector3r> &points = entry.second;
+            const ChunkCoord& coord = entry.first;
+            const std::vector<Vector3r>& points = entry.second;
 
-            Chunk &chunk = chunk_grid_[coord];
+            Chunk& chunk = chunk_grid_[coord];
             std::lock_guard<std::mutex> chunk_lock(chunk.mutex);
 
             // 简单的去重 - 检查新点是否已存在于块中
-            for (const auto &new_point : points)
+            for (const auto& new_point : points)
             {
                 bool exists = false;
-                for (const auto &existing_point : chunk.points)
+                for (const auto& existing_point : chunk.points)
                 {
                     if ((new_point - existing_point).squaredNorm() < (RESOLUTION * RESOLUTION))
                     {
@@ -723,16 +870,20 @@ private:
 
     void processDepthImage()
     {
+        steady_clock::time_point last_print_time = steady_clock::now();
+        int iteration_count = 0;
+        constexpr double print_interval = 1.0;
+
         while (depth_image_thread_running_)
         {
             // 获取无人机状态和深度图像
             auto state = airsim_client.getMultirotorState();
-            auto response = airsim_client.simGetImages({ImageCaptureBase::ImageRequest("front_center",
-                                                                                       ImageCaptureBase::ImageType::DepthPlanar, true)})[0];
+            auto response = airsim_client.simGetImages({ ImageCaptureBase::ImageRequest("front_center",
+                                                                                       ImageCaptureBase::ImageType::DepthPlanar, true) })[0];
 
             cv::Mat depth_img(response.height, response.width, CV_32FC1);
             memcpy(depth_img.data, response.image_data_float.data(),
-                   response.image_data_float.size() * sizeof(float));
+                response.image_data_float.size() * sizeof(float));
 
             // 更新无人机状态
             {
@@ -781,12 +932,30 @@ private:
                 pointcloud_queue_.push(std::move(new_points));
                 queue_cv_.notify_one();
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // 更新迭代计数
+            iteration_count++;
+
+            // 检查是否到达打印时间间隔
+            auto current_time = steady_clock::now();
+            double elapsed = duration_cast<duration<double>>(current_time - last_print_time).count();
+
+            if (elapsed >= print_interval)
+            {
+                double frequency = iteration_count / elapsed;
+                std::cout << "[Mapping] Frequency: " << frequency << " Hz" << std::endl;
+
+                // 重置计数器和时间
+                iteration_count = 0;
+                last_print_time = current_time;
+            }
+
+            // std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 };
 
-std::vector<State> findNearestPoints(const State &currentPosition, const json &pointsList, int k)
+std::vector<State> findNearestPoints(const State& currentPosition, const json& pointsList, int k)
 {
     // 创建一个包含距离和原始点索引的向量
     std::vector<std::pair<double, int>> distances;
@@ -796,11 +965,11 @@ std::vector<State> findNearestPoints(const State &currentPosition, const json &p
     for (size_t i = 0; i < pointsList.size(); ++i)
     {
         // 从JSON中提取点坐标
-        State point{pointsList[i][0], pointsList[i][1], pointsList[i][2]};
+        State point{ pointsList[i][0], pointsList[i][1], pointsList[i][2] };
         float distance = currentPosition.distanceTo(point);
-        if (distance > goal_tolerance)
+        if (distance > 80)
         {
-            distances.push_back({distance, i});
+            distances.push_back({ distance, i });
         }
     }
 
@@ -816,40 +985,39 @@ std::vector<State> findNearestPoints(const State &currentPosition, const json &p
     for (int i = 0; i < count; ++i)
     {
         int idx = distances[i].second;
-        nearestPoints.push_back(State{pointsList[idx][0], pointsList[idx][1], pointsList[idx][2]});
+        nearestPoints.push_back(State{ pointsList[idx][0], pointsList[idx][1], pointsList[idx][2] });
     }
 
     return nearestPoints;
 }
 
-void selectNewTargetPoint(const State &current_pos, const json &point_list,
-                          std::mt19937 &gen, std::uniform_int_distribution<> &dist,
-                          State &target_pos)
+void selectNewTargetPoint(const State& current_pos, const json& point_list,
+    std::mt19937& gen, std::uniform_int_distribution<>& dist,
+    State& target_pos)
 {
-    std::vector<State> nearest_points = findNearestPoints(current_pos, point_list, 5);
+    //std::vector<State> nearest_points = findNearestPoints(current_pos, point_list, 5);
     int random_index = dist(gen);
-    target_pos = nearest_points[random_index];
+    target_pos = State{ point_list[random_index][0],point_list[random_index][1],point_list[random_index][2]};
 }
 
 int main()
 {
     // 读到采样的点
-    std::ifstream file("pos_list.json");
+    std::ifstream file("pos_list2.json");
     json point_list;
     file >> point_list;
     file.close();
 
     std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<> point_selector(0, 4);
+    std::uniform_int_distribution<> point_selector(0, point_list.size()-1);
 
     try
     {
-        State start = {0, 0, -1.5f};
-        State goal = {20, 0, -1.5f};
+        State start = { 0, 0, -1.5f };
+        State goal = { 20, 0, -1.5f };
 
-        OnKiEnvironment env;
 
-        OnKiRRTPlanner planner(start, goal, env);
+        OnKiRRTPlanner planner(start, goal);
         auto planning_start_time = std::chrono::steady_clock::now();
         const int timeout_seconds = 60;
 
@@ -857,15 +1025,14 @@ int main()
         {
             auto current_time = std::chrono::steady_clock::now();
             bool is_timeout = std::chrono::duration_cast<std::chrono::seconds>(
-                                  current_time - planning_start_time)
-                                  .count() >= timeout_seconds;
-            planner.updateCurrentState();
+                current_time - planning_start_time)
+                .count() >= timeout_seconds;
 
             if (planner.isGoalReached() || is_timeout || planner.airsim_client.simGetCollisionInfo().has_collided)
             {
                 // 到达终点了，那么就找到下一个点进行规划
-                State current_position;
-                std::cout << "Collision Flag" << planner.airsim_client.simGetCollisionInfo().has_collided << std::endl;
+                State current_position, target_position;
+                selectNewTargetPoint(current_position, point_list, gen, point_selector, target_position);
                 if (is_timeout || planner.airsim_client.simGetCollisionInfo().has_collided)
                 {
 
@@ -873,17 +1040,16 @@ int main()
                     // 超时情况下，假设当前位置就是目标位置
                     current_position = planner.goal_state;
                     planner.airsim_client.simSetVehiclePose(Pose(Vector3r(current_position.x, current_position.y, current_position.z), Quaternionr(0, 0, 0, 0)), true);
+                    planner.reset(current_position, target_position);
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
                 else
                 {
                     current_position = planner.current_state;
+                    planner.setNewGoal(current_position,target_position);
                 }
-                State target_position;
-                selectNewTargetPoint(current_position, point_list, gen, point_selector, target_position);
-                planner.setNewGoal(target_position);
+
                 planning_start_time = std::chrono::steady_clock::now();
-                
             }
             else
             {
@@ -894,7 +1060,7 @@ int main()
 
         std::cout << "Goal reached successfully!" << std::endl;
     }
-    catch (const std::exception &e)
+    catch (const std::exception& e)
     {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
