@@ -4,3 +4,8 @@ airsim_OnKiRRT.vcxproj.filters
 airsim_OnKiRRT.vcxproj.user
 airsim_OnKiRRT
 x64
+camera
+colored_instance
+left_img
+right_img
+depth_img

@@ -30,8 +30,8 @@ const int planning_horizon = 10;
 const int max_samples_per_step = 1000;
 const double step_size = 2.0;
 const double goal_tolerance = 3.0;
-const double velocity = 3.0;
-const double fix_max_speed = 5.0;
+const double velocity = 30.0;
+const double fix_max_speed = 10.0;
 double max_speed = fix_max_speed;
 const double fix_delta_t = 0.2;
 double delta_t = fix_delta_t;
@@ -39,7 +39,6 @@ const double fix_control_stddev = 180.0;
 double control_stddev = fix_control_stddev;
 const double min_thrust = 9.81 * 0.5;
 const double max_thrust = 9.81 * 1.5;
-const double camera_fov = 83.0;
 json point_list;
 
 // Occupancy MAP HyperPARA
@@ -68,18 +67,6 @@ struct RecordData {
     cv::Mat segmentation_img;
     CameraInfo camInfo;
 };
-
-double calculate_vertical_fov(double camera_fov, int width, int height) {
-    // 将水平 FOV 转换为弧度
-    double hfov_rad = camera_fov * M_PI / 180.0;
-    // 计算宽高比
-    double aspect_ratio = static_cast<double>(width) / height;
-    // 计算垂直 FOV（弧度）
-    double vfov_rad = 2 * atan(tan(hfov_rad / 2) / aspect_ratio);
-    // 转换回角度
-    double vfov_deg = vfov_rad * 180.0 / M_PI;
-    return vfov_deg;
-}
 
 
 struct State
@@ -340,6 +327,7 @@ private:
     std::atomic<bool> pointcloud_thread_running_{ true };
     std::atomic<bool> depth_image_thread_running_{ true };
     std::atomic<bool> record_data_thread_running_{ true };
+    std::atomic<bool> save_data_thread_running_{ true };
     std::thread planning_thread_;
     std::thread execution_thread_;
     std::thread pointcloud_thread_;
@@ -653,18 +641,6 @@ private:
         j["position"] = { position.x(), position.y(), position.z() }; // 使用列表存储
         j["orientation"] = { orientation.w(), orientation.x(), orientation.y(), orientation.z() }; // 使用列表存储
 
-        std::cout << "3Camera Position: ("
-            << position.x() << ", "
-            << position.y() << ", "
-            << position.z() << ")" << std::endl;
-
-        // 输出相机姿态（四元数）
-        std::cout << "3Camera Orientation (Quaternion): ("
-            << orientation.w() << ", "
-            << orientation.x() << ", "
-            << orientation.y() << ", "
-            << orientation.z() << ")" << std::endl;
-
         // 添加投影矩阵
         j["projection_matrix"] = {
             { proj_mat[0][0], proj_mat[0][1], proj_mat[0][2], proj_mat[0][3] },
@@ -684,52 +660,29 @@ private:
         file.close();
     }
 
-    void saveState2(const MultirotorState& state, const std::string& filename)
-    {
-        // 提取 position 和 orientation
-        const auto& position = state.getPosition();
-        const auto& orientation = state.getOrientation();
-
-        // 构造 JSON 对象
-        json j;
-        j["position"] = { position.x(), position.y(), position.z() }; // 使用列表存储
-        j["orientation"] = { orientation.w(), orientation.x(), orientation.y(), orientation.z() }; // 使用列表存储
-
-
-        // 打开文件以写入 JSON 数据
-        std::ofstream file(folders_.state + "/" + filename, std::ios::out);
-        if (!file.is_open()) {
-            throw std::runtime_error("Failed to open file: " + filename);
-        }
-
-        // 写入 JSON 数据到文件
-        file << std::setw(4) << j << std::endl; // 格式化输出，缩进 4 个空格
-        file.close();
-    }
-
-    void saveRecordedData(const cv::Mat& left_img, const cv::Mat& right_img, const cv::Mat& depth_img, const cv::Mat& segmentation_img, const CameraInfo& camInfo)
+    void saveRecordedData(const RecordData& data)
     {
         char fileName[20];
         sprintf(fileName, "%06d.png", imageCounter);
 
         // 保存左目图像
-        if (!left_img.empty()) {
+        if (!data.left_img.empty()) {
             cv::Mat left_bgr;
-            cv::cvtColor(left_img, left_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
+            cv::cvtColor(data.left_img, left_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
             cv::imwrite(folders_.left_img + "/" + fileName, left_bgr);
         }
 
         // 保存右目图像
-        if (!right_img.empty()) {
+        if (!data.right_img.empty()) {
             cv::Mat right_bgr;
-            cv::cvtColor(right_img, right_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
+            cv::cvtColor(data.right_img, right_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
             cv::imwrite(folders_.right_img + "/" + fileName, right_bgr);
         }
 
         // 保存深度图像
-        if (!depth_img.empty()) {
+        if (!data.depth_img.empty()) {
             cv::Mat depth_in_cm;
-            depth_img.convertTo(depth_in_cm, CV_16UC1, 100.0); // 转换为厘米 (m -> cm)
+            data.depth_img.convertTo(depth_in_cm, CV_16UC1, 100.0); // 转换为厘米 (m -> cm)
 
             // 类似 np.clip 的操作，限制深度值在 [0, 65535]
             cv::Mat clipped_depth;
@@ -740,73 +693,93 @@ private:
         }
 
         // 保存分割图像
-        if (!segmentation_img.empty()) {
+        if (!data.segmentation_img.empty()) {
             cv::Mat segmentation_bgr;
-            cv::cvtColor(segmentation_img, segmentation_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
+            cv::cvtColor(data.segmentation_img, segmentation_bgr, cv::COLOR_RGB2BGR); // 转换为BGR格式
             cv::imwrite(folders_.colored_instance + "/" + fileName, segmentation_bgr);
         }
-
         char state_filename[20];
         sprintf(state_filename, "%06d.json", imageCounter);
-        saveState(camInfo, state_filename);
+        saveState(data.camInfo, state_filename);
     }
 
     void recordData()
+    {
+        while (record_data_thread_running_)
+        {
+            RecordData record;
+
+            {
+                std::unique_lock<std::mutex> lock(record_mutex_);
+
+                // 等待队列非空或线程终止
+                record_cv_.wait(lock, [this]() {
+                    return !record_queue_.empty() || !record_data_thread_running_;
+                    });
+
+                // 如果线程需要终止，则退出循环
+                if (!record_data_thread_running_)
+                    break;
+
+                // 如果队列非空，取出数据
+                if (!record_queue_.empty())
+                {
+                    record = std::move(record_queue_.front());
+                    record_queue_.pop();
+                }
+            }
+
+            // 如果记录数据不为空，则保存数据
+            if (!record.left_img.empty() || !record.right_img.empty() ||
+                !record.depth_img.empty() || !record.segmentation_img.empty())
+            {
+                saveRecordedData(record);
+
+                // 增加计数器
+                ++imageCounter;
+            }
+        }
+    }
+
+    void pushRecordData(const cv::Mat& left_img, const cv::Mat& right_img,
+        const cv::Mat& depth_img, const cv::Mat& segmentation_img,
+        const CameraInfo& camInfo)
+    {
+        // 创建包含 MultirotorState 的 RecordData
+        RecordData record{ left_img.clone(), right_img.clone(), depth_img.clone(), segmentation_img.clone(), camInfo};
+
+        {
+            std::lock_guard<std::mutex> lock(record_mutex_);
+            record_queue_.push(std::move(record));
+        }
+
+        record_cv_.notify_one(); // 通知消费者线程
+    }
+
+
+    void processRecordData()
     {
         std::vector<ImageRequest> imageRequests = {
             ImageRequest("front_left", ImageType::Scene, false, false),
             ImageRequest("front_right", ImageType::Scene, false, false),
             ImageRequest("front_left", ImageType::DepthPlanar, true, false),
-            ImageRequest("front_left", ImageType::Segmentation, false, false)
+            ImageRequest("front_left", ImageType::Segmentation, false, false),
         };
 
         while (record_data_thread_running_)
         {
+            auto start_time = steady_clock::now();
             airsim_client.simPause(true);
             CameraInfo camInfo = airsim_client.simGetCameraInfo("front_left");
-            auto state = airsim_client.getMultirotorState();
             const std::vector<ImageResponse>& responses = airsim_client.simGetImages(imageRequests);
             airsim_client.simPause(false);
+            cv::Mat left_img(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[0].image_data_uint8.data());
+            cv::Mat right_img(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[1].image_data_uint8.data());
+            cv::Mat depth_img(IMAGE_HEIGHT, IMAGE_WIDTH, CV_32FC1, (void*)responses[2].image_data_float.data());
+            cv::Mat segmentation_img(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[3].image_data_uint8.data());
 
-            std::cout << "1Camera Position: ("
-                << responses[0].camera_position.x() << ", "
-                << responses[0].camera_position.y() << ", "
-                << responses[0].camera_position.z() << ")" << std::endl;
+            pushRecordData(left_img, right_img, depth_img, segmentation_img, camInfo);
 
-            // 输出相机姿态（四元数）
-            std::cout << "1Camera Orientation (Quaternion): ("
-                << responses[0].camera_orientation.w() << ", "
-                << responses[0].camera_orientation.x() << ", "
-                << responses[0].camera_orientation.y() << ", "
-                << responses[0].camera_orientation.z() << ")" << std::endl;
-
-            std::cout << "2Camera Position: ("
-                << responses[2].camera_position.x() << ", "
-                << responses[2].camera_position.y() << ", "
-                << responses[2].camera_position.z() << ")" << std::endl;
-
-            // 输出相机姿态（四元数）
-            std::cout << "2Camera Orientation (Quaternion): ("
-                << responses[2].camera_orientation.w() << ", "
-                << responses[2].camera_orientation.x() << ", "
-                << responses[2].camera_orientation.y() << ", "
-                << responses[2].camera_orientation.z() << ")" << std::endl;
-           
-            // 提取图像数据
-            cv::Mat left_img_temp(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[0].image_data_uint8.data());
-            cv::Mat right_img_temp(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[1].image_data_uint8.data());
-            cv::Mat depth_img_temp(IMAGE_HEIGHT, IMAGE_WIDTH, CV_32FC1, (void*)responses[2].image_data_float.data());
-            cv::Mat segmentation_img_temp(IMAGE_HEIGHT, IMAGE_WIDTH, CV_8UC3, (void*)responses[3].image_data_uint8.data());
-
-            // 深拷贝数据
-            cv::Mat left_img = left_img_temp.clone();
-            cv::Mat right_img = right_img_temp.clone();
-            cv::Mat depth_img = depth_img_temp.clone();
-            cv::Mat segmentation_img = segmentation_img_temp.clone();
-
-            // 调用保存函数
-            saveRecordedData(left_img, right_img, depth_img, segmentation_img, camInfo);
-            ++imageCounter;
         }
     }
 
@@ -819,9 +792,11 @@ private:
         while (depth_image_thread_running_)
         {
             auto start_time = steady_clock::now();
+            airsim_client.simPause(true);
             auto state = airsim_client.getMultirotorState();
             auto response = airsim_client.simGetImages({ ImageCaptureBase::ImageRequest("front_center",
                                                                                           ImageCaptureBase::ImageType::DepthPlanar, true) })[0];
+            airsim_client.simPause(false);
             cv::Mat depth_img(response.height, response.width, CV_32FC1);
             memcpy(depth_img.data, response.image_data_float.data(),
                 response.image_data_float.size() * sizeof(float));
@@ -832,9 +807,8 @@ private:
             }
 
             Eigen::Matrix3f rotation_matrix = quaternionToRotationMatrix(drone_orientation_);
-            const float fov_x = camera_fov * M_PI / 180.0f;
-            const float vfov = calculate_vertical_fov(camera_fov, response.width, response.height);
-            const float fov_y = vfov * M_PI / 180.0f;
+            const float fov_x = camera_info_.fov * 3.14159265f / 180.0f;
+            const float fov_y = camera_info_.fov * 3.14159265f * depth_img.rows / (depth_img.cols * 180.0f);
 
             std::vector<Vector3r> new_points;
             new_points.reserve(depth_img.rows * depth_img.cols / 4);
@@ -1608,9 +1582,11 @@ int main()
     std::ifstream file("E:/industrialCity/pos_list.json");
     file >> point_list;
     file.close();
-    OnKiRRTPlanner planner(start, goal);
+
     try
     {
+        OnKiRRTPlanner planner(start, goal);
+
         constexpr double goal_update_interval = 600.0;
         auto last_goal_update = std::chrono::steady_clock::now();
 
@@ -1636,19 +1612,12 @@ int main()
                     << goal.position.x() << ", " << goal.position.y() << ", " << goal.position.z() << ")" << std::endl;
                 last_goal_update = now;
             }
-            //std::cout << "旋转90度..." << std::endl;
-
-            //auto future = planner.airsim_client.rotateByYawRateAsync(30.0f, 3.0f);  // 30度/秒，持续3秒 = 90度
-            //future->waitOnLastTask();
-
-            //std::cout << "旋转完成，等待下次旋转..." << std::endl;
             //std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
     catch (const std::exception& e)
     {
         std::cerr << "Error: " << e.what() << std::endl;
-        planner.airsim_client.simPause(false);
         return 1;
     }
     return 0;
